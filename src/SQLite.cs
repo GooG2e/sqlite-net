@@ -211,6 +211,7 @@ namespace SQLite
 		static SQLiteConnection ()
 		{
 			SQLitePCL.Batteries_V2.Init ();
+			
 		}
 #endif
 
@@ -523,7 +524,7 @@ namespace SQLite
 			}
 			else {
 				result = CreateTableResult.Migrated;
-				MigrateTable (map, existingCols);
+				MigrateTable (map, existingCols, createFlags);
 			}
 
 			var indexes = new Dictionary<string, IndexInfo> ();
@@ -760,25 +761,83 @@ namespace SQLite
 			return Query<ColumnInfo> (query);
 		}
 
-		void MigrateTable (TableMapping map, List<ColumnInfo> existingCols)
+		void MigrateTable (TableMapping map, List<ColumnInfo> existingCols, CreateFlags createFlags =CreateFlags.None)
 		{
-			var toBeAdded = new List<TableMapping.Column> ();
-
-			foreach (var p in map.Columns) {
+			var recreate = false;
+			foreach (var c in existingCols) {
 				var found = false;
-				foreach (var c in existingCols) {
+				foreach (var p in map.Columns) {
 					found = (string.Compare (p.Name, c.Name, StringComparison.OrdinalIgnoreCase) == 0);
 					if (found)
 						break;
 				}
 				if (!found) {
-					toBeAdded.Add (p);
+					recreate = true;
+					break;
 				}
 			}
+			if (recreate) {
+				var mergeList = new List<TableMapping.Column> ();
+				foreach (var c in existingCols) {
+					foreach (var p in map.Columns) {
+						if (string.Compare (p.Name, c.Name, StringComparison.OrdinalIgnoreCase) == 0) {
+							mergeList.Add (p);
+							break;
+						}
 
-			foreach (var p in toBeAdded) {
-				var addCol = "alter table \"" + map.TableName + "\" add column " + Orm.SqlDecl (p, StoreDateTimeAsTicks);
-				Execute (addCol);
+					}
+				}
+
+				var tmpTableName = string.Format ("_{0}_{1:yyyy}{1:MM}{1:dd}", map.TableName, DateTime.Now);
+				var renameTable = string.Format ("alter table \"{0}\" rename to \"{1}\"", map.TableName, tmpTableName);
+				Execute (renameTable);
+
+				bool fts3 = (createFlags & CreateFlags.FullTextSearch3) != 0;
+				bool fts4 = (createFlags & CreateFlags.FullTextSearch4) != 0;
+				bool fts = fts3 || fts4;
+				var @virtual = fts ? "virtual " : string.Empty;
+				var @using = fts3 ? "using fts3 " : fts4 ? "using fts4 " : string.Empty;
+
+				// Build query.
+				var query = "create " + @virtual + "table if not exists \"" + map.TableName + "\" " + @using + "(\n";
+				var decls = map.Columns.Select (p => Orm.SqlDecl (p, StoreDateTimeAsTicks));
+				var decl = string.Join (",\n", decls.ToArray ());
+				query += decl;
+				query += ")";
+				if (map.WithoutRowId) {
+					query += " without rowid";
+				}
+				Execute (query);
+
+				var clm = mergeList.Select (p => "\""+p.Name+"\"");
+				var clmQuery = string.Join (",", clm.ToArray ());
+
+				var moveDataQuery = string.Format ("insert into \"{0}\" ({1}) \n select {1} from \"{2}\"", map.TableName, clmQuery,
+					tmpTableName);
+				Execute (moveDataQuery);
+
+				var dropQuery = string.Format ("drop table \"{0}\"",tmpTableName);
+				Execute (dropQuery);
+			}
+			else {
+				var toBeAdded = new List<TableMapping.Column> ();
+
+				foreach (var p in map.Columns) {
+					var found = false;
+					foreach (var c in existingCols) {
+						found = (string.Compare (p.Name, c.Name, StringComparison.OrdinalIgnoreCase) == 0);
+						if (found)
+							break;
+					}
+					if (!found) {
+						toBeAdded.Add (p);
+					}
+				}
+
+				foreach (var p in toBeAdded) {
+					var addCol = "alter table \"" + map.TableName + "\" add column " + Orm.SqlDecl (p, StoreDateTimeAsTicks);
+					Execute (addCol);
+				}
 			}
 		}
 
@@ -2084,6 +2143,15 @@ namespace SQLite
 	}
 
 	[AttributeUsage (AttributeTargets.Property)]
+	public class DefaultAttribute : Attribute {
+		public string DefaultValue { get; set; }
+
+		public DefaultAttribute (string defaultValue) {
+			DefaultValue = defaultValue;
+		}
+	}
+
+	[AttributeUsage (AttributeTargets.Property)]
 	public class PrimaryKeyAttribute : Attribute
 	{
 	}
@@ -2307,6 +2375,8 @@ namespace SQLite
 
 			public bool IsPK { get; private set; }
 
+			public string DefaultValue { get; private set; }
+
 			public IEnumerable<IndexedAttribute> Indices { get; set; }
 
 			public bool IsNullable { get; private set; }
@@ -2345,7 +2415,7 @@ namespace SQLite
 				}
 				IsNullable = !(IsPK || Orm.IsMarkedNotNull (prop));
 				MaxStringLength = Orm.MaxStringLength (prop);
-
+				DefaultValue = Orm.GetDefaultValue (prop);
 				StoreAsText = prop.PropertyType.GetTypeInfo ().CustomAttributes.Any (x => x.AttributeType == typeof (StoreAsTextAttribute));
 			}
 
@@ -2448,6 +2518,11 @@ namespace SQLite
 			if (!string.IsNullOrEmpty (p.Collation)) {
 				decl += "collate " + p.Collation + " ";
 			}
+
+			if (!string.IsNullOrEmpty (p.DefaultValue)) {
+				decl += "default " + p.DefaultValue + " ";
+			}
+			
 
 			return decl;
 		}
@@ -2572,6 +2647,16 @@ namespace SQLite
 		public static bool IsMarkedNotNull (MemberInfo p)
 		{
 			return p.CustomAttributes.Any (x => x.AttributeType == typeof (NotNullAttribute));
+		}
+
+		public static string GetDefaultValue (MemberInfo p)
+		{
+			var attr = p.CustomAttributes.FirstOrDefault (x => x.AttributeType == typeof(DefaultAttribute));
+			if (attr != null) {
+				var attrv = (DefaultAttribute)InflateAttribute (attr);
+				return attrv.DefaultValue;
+			}
+			return null;
 		}
 	}
 
@@ -4100,6 +4185,7 @@ namespace SQLite
 
 		public static ColType ColumnType (Sqlite3Statement stmt, int index)
 		{
+			
 			return (ColType)Sqlite3.sqlite3_column_type (stmt, index);
 		}
 
